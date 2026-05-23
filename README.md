@@ -35,7 +35,7 @@ cargo install transession
 Or install directly from GitHub:
 
 ```bash
-cargo install --git https://github.com/inmzhang/transession.git
+cargo install --git https://github.com/KilimcininKorOglu/transession.git
 ```
 
 Or from a local checkout:
@@ -47,7 +47,7 @@ cargo install --path .
 For development:
 
 ```bash
-git clone https://github.com/inmzhang/transession.git
+git clone https://github.com/KilimcininKorOglu/transession.git
 cd transession
 make build
 ```
@@ -92,6 +92,31 @@ transession --from claude --to droid <SESSION_ID> --output ./tmp/factory-home
 When opening after translation, `transession` launches the target CLI with the translated session id. For custom output roots, it sets `CODEX_HOME` for Codex, `CLAUDE_CONFIG_DIR` plus `CLAUDE_HOME` for Claude, and `FACTORY_HOME` plus `DROID_HOME` for Droid.
 
 For Codex custom output roots, `transession` also links the installed `auth.json` into the target home when needed so the launched Codex process can authenticate immediately.
+
+## Bulk Conversion
+
+Bulk conversion is intentionally dry-run first. A bulk command discovers native sessions from the selected source store, converts them into a temporary target home, validates the generated files, and leaves the real target store untouched unless `--apply` is passed:
+
+```bash
+transession bulk --from claude --to droid --dry-run
+transession bulk --from droid --to claude --dry-run
+transession bulk --from codex --to droid --dry-run
+```
+
+After the dry run succeeds, write to an explicit target home:
+
+```bash
+transession bulk --from droid --to claude --apply --output ./tmp/claude-home
+transession bulk --from claude --to droid --apply --output ./tmp/factory-home
+```
+
+To write into the configured target store, run:
+
+```bash
+transession bulk --from codex --to droid --apply
+```
+
+Bulk conversion supports Codex, Claude, and Droid as native source and target formats. The source and target must be different native formats. Portable IR is intentionally not a bulk source or target. Bulk apply refuses standalone `.jsonl` outputs and stops before writing if target session files already exist. Droid settings sidecars are treated as target conflicts; existing Codex `session_index.jsonl` and Claude `history.jsonl` files are allowed because those files are append-only indexes. Bulk conversion never opens target agents automatically.
 
 ## Session Lookup
 
@@ -140,6 +165,7 @@ Local development uses the Makefile:
 ```bash
 make build
 make run ARGS="--from claude --to droid <SESSION_ID> --no-open"
+cargo run -- bulk --from claude --to droid --dry-run
 make fmt
 make clippy
 make test
@@ -215,6 +241,8 @@ There is also a portable intermediate representation for debugging and advanced 
 Advanced commands remain available:
 
 ```bash
+transession bulk --from claude --to droid --dry-run
+transession bulk --from droid --to claude --apply --output ./tmp/claude-home
 transession inspect <SESSION_ID> --from claude
 transession inspect <SESSION_ID> --from droid
 transession import <SESSION_ID> ./session.json --from codex

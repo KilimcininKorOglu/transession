@@ -773,3 +773,301 @@ fn quick_cli_opens_target_agent_by_default() {
     assert!(log.contains("resume"));
     assert!(log.contains("CODEX_HOME="));
 }
+
+#[test]
+fn bulk_cli_dry_run_converts_all_claude_sessions_without_real_write() {
+    let source_home = tempdir().unwrap();
+    let target_home = tempdir().unwrap();
+    write_bulk_fixtures(source_home.path(), SessionFormat::Claude);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_transession"))
+        .arg("bulk")
+        .arg("--from")
+        .arg("claude")
+        .arg("--to")
+        .arg("droid")
+        .arg("--dry-run")
+        .env("TRANSESSION_CLAUDE_HOME", source_home.path())
+        .env("TRANSESSION_DROID_HOME", target_home.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("found claude sessions: 2"));
+    assert!(stdout.contains("validated droid sessions: 2"));
+    assert!(stdout.contains("dry run only"));
+    assert!(!target_home.path().join("sessions").exists());
+}
+
+#[test]
+fn bulk_cli_apply_writes_all_droid_sessions_after_temp_validation() {
+    let source_home = tempdir().unwrap();
+    let target_home = tempdir().unwrap();
+    write_bulk_fixtures(source_home.path(), SessionFormat::Claude);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_transession"))
+        .arg("bulk")
+        .arg("--from")
+        .arg("claude")
+        .arg("--to")
+        .arg("droid")
+        .arg("--apply")
+        .env("TRANSESSION_CLAUDE_HOME", source_home.path())
+        .env("TRANSESSION_DROID_HOME", target_home.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("wrote droid sessions: 2"));
+    let droid_files = session_files(target_home.path(), SessionFormat::Droid);
+    assert_eq!(droid_files.len(), 2);
+    for path in &droid_files {
+        assert!(path.with_extension("settings.json").exists());
+    }
+    load_session(&droid_files[0], SourceFormat::Droid).unwrap();
+}
+
+#[test]
+fn bulk_cli_apply_refuses_existing_droid_targets() {
+    let source_home = tempdir().unwrap();
+    let target_home = tempdir().unwrap();
+    write_bulk_fixtures(source_home.path(), SessionFormat::Claude);
+
+    let first = Command::new(env!("CARGO_BIN_EXE_transession"))
+        .arg("bulk")
+        .arg("--from")
+        .arg("claude")
+        .arg("--to")
+        .arg("droid")
+        .arg("--apply")
+        .env("TRANSESSION_CLAUDE_HOME", source_home.path())
+        .env("TRANSESSION_DROID_HOME", target_home.path())
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+
+    let second = Command::new(env!("CARGO_BIN_EXE_transession"))
+        .arg("bulk")
+        .arg("--from")
+        .arg("claude")
+        .arg("--to")
+        .arg("droid")
+        .arg("--apply")
+        .env("TRANSESSION_CLAUDE_HOME", source_home.path())
+        .env("TRANSESSION_DROID_HOME", target_home.path())
+        .output()
+        .unwrap();
+
+    assert!(!second.status.success());
+    let stderr = String::from_utf8(second.stderr).unwrap();
+    assert!(stderr.contains("bulk apply would overwrite existing droid files"));
+}
+
+#[test]
+fn bulk_cli_apply_refuses_existing_droid_settings_sidecar() {
+    let source_home = tempdir().unwrap();
+    let planned_home = tempdir().unwrap();
+    let target_home = tempdir().unwrap();
+    write_bulk_fixtures(source_home.path(), SessionFormat::Claude);
+
+    let mut session = load_session(&fixture("claude_sample.jsonl"), SourceFormat::Claude).unwrap();
+    session.metadata.extra.insert(
+        "droid_settings".to_string(),
+        serde_json::json!({ "model": "sonnet" }),
+    );
+    let planned_path = materialize(&session, SessionFormat::Droid, planned_home.path()).unwrap();
+    let relative = planned_path.strip_prefix(planned_home.path()).unwrap();
+    let target_settings = target_home
+        .path()
+        .join(relative)
+        .with_extension("settings.json");
+    fs::create_dir_all(target_settings.parent().unwrap()).unwrap();
+    fs::write(&target_settings, "{}").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_transession"))
+        .arg("bulk")
+        .arg("--from")
+        .arg("claude")
+        .arg("--to")
+        .arg("droid")
+        .arg("--apply")
+        .env("TRANSESSION_CLAUDE_HOME", source_home.path())
+        .env("TRANSESSION_DROID_HOME", target_home.path())
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(!target_home.path().join(relative).exists());
+}
+
+#[test]
+fn bulk_cli_rejects_jsonl_output() {
+    let source_home = tempdir().unwrap();
+    write_bulk_fixtures(source_home.path(), SessionFormat::Claude);
+    let output = source_home.path().join("target.jsonl");
+
+    let result = Command::new(env!("CARGO_BIN_EXE_transession"))
+        .arg("bulk")
+        .arg("--from")
+        .arg("claude")
+        .arg("--to")
+        .arg("droid")
+        .arg("--apply")
+        .arg("--output")
+        .arg(&output)
+        .env("TRANSESSION_CLAUDE_HOME", source_home.path())
+        .output()
+        .unwrap();
+
+    assert!(!result.status.success());
+    let stderr = String::from_utf8(result.stderr).unwrap();
+    assert!(stderr.contains("bulk output must be a native home directory"));
+}
+
+#[test]
+fn bulk_cli_rejects_ir_and_same_format_requests() {
+    let ir = Command::new(env!("CARGO_BIN_EXE_transession"))
+        .arg("bulk")
+        .arg("--from")
+        .arg("ir")
+        .arg("--to")
+        .arg("droid")
+        .output()
+        .unwrap();
+    assert!(!ir.status.success());
+
+    let same = Command::new(env!("CARGO_BIN_EXE_transession"))
+        .arg("bulk")
+        .arg("--from")
+        .arg("claude")
+        .arg("--to")
+        .arg("claude")
+        .output()
+        .unwrap();
+    assert!(!same.status.success());
+    let stderr = String::from_utf8(same.stderr).unwrap();
+    assert!(stderr.contains("different source and target formats"));
+}
+
+#[test]
+fn bulk_cli_fails_before_apply_when_source_contains_invalid_claude_jsonl() {
+    let source_home = tempdir().unwrap();
+    let target_home = tempdir().unwrap();
+    write_bulk_fixtures(source_home.path(), SessionFormat::Claude);
+    let bad_dir = source_home.path().join("projects").join("bad");
+    fs::create_dir_all(&bad_dir).unwrap();
+    fs::write(bad_dir.join("bad.jsonl"), "not json").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_transession"))
+        .arg("bulk")
+        .arg("--from")
+        .arg("claude")
+        .arg("--to")
+        .arg("droid")
+        .arg("--apply")
+        .env("TRANSESSION_CLAUDE_HOME", source_home.path())
+        .env("TRANSESSION_DROID_HOME", target_home.path())
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(!target_home.path().join("sessions").exists());
+}
+
+#[test]
+fn bulk_cli_apply_converts_droid_sessions_to_claude() {
+    let source_home = tempdir().unwrap();
+    let target_home = tempdir().unwrap();
+    write_bulk_fixtures(source_home.path(), SessionFormat::Droid);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_transession"))
+        .arg("bulk")
+        .arg("--from")
+        .arg("droid")
+        .arg("--to")
+        .arg("claude")
+        .arg("--apply")
+        .env("TRANSESSION_DROID_HOME", source_home.path())
+        .env("TRANSESSION_CLAUDE_HOME", target_home.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let claude_files = session_files(target_home.path(), SessionFormat::Claude);
+    assert_eq!(claude_files.len(), 1);
+    assert!(target_home.path().join("history.jsonl").exists());
+    load_session(&claude_files[0], SourceFormat::Claude).unwrap();
+}
+
+#[test]
+fn bulk_cli_apply_converts_claude_sessions_to_codex_with_existing_index() {
+    let source_home = tempdir().unwrap();
+    let target_home = tempdir().unwrap();
+    write_bulk_fixtures(source_home.path(), SessionFormat::Claude);
+    fs::write(target_home.path().join("session_index.jsonl"), "").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_transession"))
+        .arg("bulk")
+        .arg("--from")
+        .arg("claude")
+        .arg("--to")
+        .arg("codex")
+        .arg("--apply")
+        .env("TRANSESSION_CLAUDE_HOME", source_home.path())
+        .env("TRANSESSION_CODEX_HOME", target_home.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let codex_files = session_files(target_home.path(), SessionFormat::Codex);
+    assert_eq!(codex_files.len(), 2);
+    assert!(target_home.path().join("session_index.jsonl").exists());
+    load_session(&codex_files[0], SourceFormat::Codex).unwrap();
+}
+
+fn write_bulk_fixtures(home: &std::path::Path, format: SessionFormat) {
+    let fixtures: &[(&str, SourceFormat)] = match format {
+        SessionFormat::Codex => &[
+            ("codex_sample.jsonl", SourceFormat::Codex),
+            ("codex_current_sample.jsonl", SourceFormat::Codex),
+        ],
+        SessionFormat::Claude => &[
+            ("claude_sample.jsonl", SourceFormat::Claude),
+            ("claude_current_sample.jsonl", SourceFormat::Claude),
+        ],
+        SessionFormat::Droid => &[("droid_sample.jsonl", SourceFormat::Droid)],
+        SessionFormat::Ir => panic!("IR is not a native bulk fixture format"),
+    };
+
+    for (fixture_name, source_format) in fixtures {
+        let session = load_session(&fixture(fixture_name), *source_format).unwrap();
+        materialize(&session, format, home).unwrap();
+    }
+}
+
+fn session_files(home: &std::path::Path, format: SessionFormat) -> Vec<std::path::PathBuf> {
+    let root = match format {
+        SessionFormat::Codex | SessionFormat::Droid => home.join("sessions"),
+        SessionFormat::Claude => home.join("projects"),
+        SessionFormat::Ir => panic!("IR is not a native bulk fixture format"),
+    };
+    let mut stack = vec![root];
+    let mut files = Vec::new();
+    while let Some(dir) = stack.pop() {
+        if !dir.exists() {
+            continue;
+        }
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files
+}

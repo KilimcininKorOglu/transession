@@ -187,6 +187,29 @@ pub fn default_output_root(target: SessionFormat) -> Result<PathBuf> {
     }
 }
 
+pub fn list_sessions(format: SessionFormat) -> Result<Vec<PathBuf>> {
+    let root = match format {
+        SessionFormat::Codex => codex_root()?.join("sessions"),
+        SessionFormat::Claude => claude_root()?.join("projects"),
+        SessionFormat::Droid => droid_root()?.join("sessions"),
+        SessionFormat::Ir => bail!("IR bulk input is not supported"),
+    };
+
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut sessions = collect_in_tree(&root, |path| {
+        path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+    })?;
+    sessions.sort();
+    Ok(sessions)
+}
+
+pub fn list_claude_sessions() -> Result<Vec<PathBuf>> {
+    list_sessions(SessionFormat::Claude)
+}
+
 fn resolve_codex_session_id(session_id: &str) -> Result<PathBuf> {
     let root = codex_root()?;
     let sessions_root = root.join("sessions");
@@ -279,22 +302,33 @@ fn find_in_tree<F>(root: &Path, predicate: F) -> Result<PathBuf>
 where
     F: Fn(&Path) -> bool + Copy,
 {
+    collect_in_tree(root, predicate)?
+        .into_iter()
+        .next()
+        .with_context(|| format!("could not find a matching session under {}", root.display()))
+}
+
+fn collect_in_tree<F>(root: &Path, predicate: F) -> Result<Vec<PathBuf>>
+where
+    F: Fn(&Path) -> bool + Copy,
+{
+    let mut matches = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let entries = match fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(_) => continue,
-        };
+        let entries = fs::read_dir(&dir)
+            .with_context(|| format!("failed to read directory {}", dir.display()))?;
 
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry =
+                entry.with_context(|| format!("failed to read entry in {}", dir.display()))?;
             let path = entry.path();
             if path.is_dir() {
                 stack.push(path);
             } else if predicate(&path) {
-                return Ok(path);
+                matches.push(path);
             }
         }
     }
 
-    bail!("could not find a matching session under {}", root.display())
+    Ok(matches)
 }

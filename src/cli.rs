@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -19,7 +19,7 @@ use crate::ir::{SessionEvent, SessionFormat, SourceFormat, UniversalSession};
     about = "Translate session storage between Codex, Claude, and a universal IR",
     args_conflicts_with_subcommands = true,
     subcommand_negates_reqs = true,
-    after_help = "Quick usage:\n  transession --from claude --to codex <SESSION_ID>\n  transession --from codex --to droid <SESSION_ID>\n  transession --from droid --to claude <SESSION_ID>\n  transession --from claude --to codex <SESSION_ID> --no-open\n\nAdvanced usage remains available through subcommands such as inspect/import/export/convert."
+    after_help = "Quick usage:\n  transession --from claude --to codex <SESSION_ID>\n  transession --from codex --to droid <SESSION_ID>\n  transession --from droid --to claude <SESSION_ID>\n  transession --from claude --to codex <SESSION_ID> --no-open\n  transession bulk --from claude --to droid --dry-run\n\nAdvanced usage remains available through subcommands such as inspect/import/export/convert/bulk."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -49,6 +49,7 @@ enum Command {
     Import(ImportArgs),
     Export(ExportArgs),
     Convert(ConvertArgs),
+    Bulk(BulkArgs),
 }
 
 #[derive(Debug, Args)]
@@ -90,6 +91,54 @@ struct ConvertArgs {
     new_session_id: bool,
 }
 
+#[derive(Debug, Args)]
+struct BulkArgs {
+    #[arg(long, value_enum)]
+    from: SessionFormat,
+    #[arg(long, value_enum)]
+    to: SessionFormat,
+    #[arg(long)]
+    dry_run: bool,
+    #[arg(long)]
+    apply: bool,
+    #[arg(long)]
+    output: Option<PathBuf>,
+}
+
+struct BulkConvertedSession {
+    source_path: PathBuf,
+    session_id: String,
+    relative_target_path: PathBuf,
+}
+
+struct TempNativeHome {
+    path: PathBuf,
+}
+
+impl TempNativeHome {
+    fn create(target: SessionFormat) -> Result<Self> {
+        let path = std::env::temp_dir().join(format!(
+            "transession-bulk-{}-{}",
+            format_name(target),
+            Uuid::now_v7()
+        ));
+        fs::create_dir_all(&path).with_context(|| {
+            format!(
+                "failed to create temporary {} home {}",
+                format_name(target),
+                path.display()
+            )
+        })?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for TempNativeHome {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
 
@@ -98,6 +147,7 @@ pub fn run() -> Result<()> {
         Some(Command::Import(args)) => import(args),
         Some(Command::Export(args)) => export(args),
         Some(Command::Convert(args)) => convert(args),
+        Some(Command::Bulk(args)) => bulk(args),
         None => quick_convert(cli),
     }
 }
@@ -147,6 +197,171 @@ fn quick_convert(cli: Cli) -> Result<()> {
         cli.no_open,
     )?;
     Ok(())
+}
+
+fn bulk(args: BulkArgs) -> Result<()> {
+    validate_bulk_args(&args)?;
+
+    let source_paths = formats::list_sessions(args.from)?;
+    println!(
+        "found {} sessions: {}",
+        format_name(args.from),
+        source_paths.len()
+    );
+
+    let temp_home = TempNativeHome::create(args.to)?;
+    let converted = bulk_convert(&source_paths, args.from, args.to, &temp_home.path)?;
+    println!(
+        "validated {} sessions: {}",
+        format_name(args.to),
+        converted.len()
+    );
+
+    if !args.apply {
+        let target = match args.output {
+            Some(path) => path,
+            None => default_output_root(args.to)?,
+        };
+        println!(
+            "dry run only; pass --apply to write to {}",
+            target.display()
+        );
+        return Ok(());
+    }
+
+    let output = match args.output {
+        Some(path) => path,
+        None => default_output_root(args.to)?,
+    };
+    preflight_bulk_targets(&converted, &output, args.to)?;
+    let written = bulk_convert(&source_paths, args.from, args.to, &output)?;
+
+    println!("wrote {} sessions: {}", format_name(args.to), written.len());
+    println!("stored under: {}", output.display());
+    for session in written.iter().take(3) {
+        if let Some(hint) = resume_hint(args.to, &session.session_id) {
+            println!("resume with: {hint}");
+        }
+    }
+    Ok(())
+}
+
+fn validate_bulk_args(args: &BulkArgs) -> Result<()> {
+    if args.apply && args.dry_run {
+        bail!("--apply and --dry-run cannot be used together");
+    }
+    if args.from == SessionFormat::Ir || args.to == SessionFormat::Ir {
+        bail!("bulk conversion only supports native Codex, Claude, and Droid formats");
+    }
+    if args.from == args.to {
+        bail!("bulk conversion requires different source and target formats");
+    }
+    if let Some(output) = &args.output
+        && output.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+    {
+        bail!("bulk output must be a native home directory, not a standalone .jsonl file");
+    }
+    Ok(())
+}
+
+fn bulk_convert(
+    source_paths: &[PathBuf],
+    from: SessionFormat,
+    to: SessionFormat,
+    output_root: &Path,
+) -> Result<Vec<BulkConvertedSession>> {
+    let source_format = source_format_from_native(from)?;
+    let target_format = source_format_from_native(to)?;
+    let mut converted = Vec::new();
+    for source_path in source_paths {
+        let mut session = load_session(source_path, source_format).with_context(|| {
+            format!(
+                "failed to load {} session {}",
+                format_name(from),
+                source_path.display()
+            )
+        })?;
+        maybe_rekey_session(&mut session, false, to);
+        let path = materialize(&session, to, output_root).with_context(|| {
+            format!(
+                "failed to materialize {} session from {}",
+                format_name(to),
+                source_path.display()
+            )
+        })?;
+        load_session(&path, target_format).with_context(|| {
+            format!(
+                "failed to validate {} session {}",
+                format_name(to),
+                path.display()
+            )
+        })?;
+        let relative_target_path = path.strip_prefix(output_root).with_context(|| {
+            format!(
+                "{} output {} was not written under {}",
+                format_name(to),
+                path.display(),
+                output_root.display()
+            )
+        })?;
+        converted.push(BulkConvertedSession {
+            source_path: source_path.clone(),
+            session_id: session.metadata.session_id,
+            relative_target_path: relative_target_path.to_path_buf(),
+        });
+    }
+    Ok(converted)
+}
+
+fn preflight_bulk_targets(
+    converted: &[BulkConvertedSession],
+    output_root: &Path,
+    target: SessionFormat,
+) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    let mut conflicts = Vec::new();
+    for session in converted {
+        if !seen.insert(session.relative_target_path.clone()) {
+            conflicts.push(format!(
+                "duplicate target {} from {}",
+                output_root.join(&session.relative_target_path).display(),
+                session.source_path.display()
+            ));
+            continue;
+        }
+
+        let target_path = output_root.join(&session.relative_target_path);
+        if target_path.exists() {
+            conflicts.push(target_path.display().to_string());
+        }
+        if target == SessionFormat::Droid {
+            let settings_path = target_path.with_extension("settings.json");
+            if settings_path.exists() {
+                conflicts.push(settings_path.display().to_string());
+            }
+        }
+    }
+
+    if !conflicts.is_empty() {
+        conflicts.sort();
+        conflicts.dedup();
+        bail!(
+            "bulk apply would overwrite existing {} files:\n{}",
+            format_name(target),
+            conflicts.join("\n")
+        );
+    }
+
+    Ok(())
+}
+
+fn source_format_from_native(format: SessionFormat) -> Result<SourceFormat> {
+    match format {
+        SessionFormat::Codex => Ok(SourceFormat::Codex),
+        SessionFormat::Claude => Ok(SourceFormat::Claude),
+        SessionFormat::Droid => Ok(SourceFormat::Droid),
+        SessionFormat::Ir => bail!("IR is not a native session format"),
+    }
 }
 
 fn inspect(args: InspectArgs) -> Result<()> {

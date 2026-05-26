@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.4] - 2026-05-27
+
+### Added
+- Add Claude subagent pruning during Claude-to-Droid bulk discovery.
+
+### Changed
+
+### Fixed
+
 ## [0.1.3] - 2026-05-24
 
 ### Added
